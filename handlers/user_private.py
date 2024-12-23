@@ -1,131 +1,67 @@
-from typing import Optional
+from aiogram import types, Router
+from aiogram.filters import CommandStart
 
-from aiogram.types import InputMediaPhoto
 from sqlalchemy.ext.asyncio import AsyncSession
+from database.db_requests import (
+    orm_add_to_cart,
+    orm_add_user,
+)
+from handlers.menu_processing import get_menu_content
 
-from database.db_requests import orm_get_banner, orm_get_categories, orm_get_products, Paginator, orm_get_user_carts, \
-    orm_add_to_cart, orm_reduce_product_in_cart, orm_delete_from_cart
-from keyboards.inline import get_user_main_btns, get_user_catalog_btns, get_products_btns, get_user_cart
+from keyboards.inline import MenuCallBack
 
-
-async def main_menu(session, level, menu_name):
-    banner = await orm_get_banner(session, menu_name)
-    image = InputMediaPhoto(media=banner.image, caption=banner.description)
-
-    keyboard = get_user_main_btns(level=level)
-
-    return image, keyboard
+user_private_router = Router()
 
 
-async def catalog(session, level, menu_name):
-    banner = await orm_get_banner(session, menu_name)
-    image = InputMediaPhoto(media=banner.image, caption=banner.description)
+@user_private_router.message(CommandStart())
+async def start_cmd(message: types.Message, session: AsyncSession):
+    media, reply_markup = await get_menu_content(session, level=0, menu_name='main')
 
-    categories = await orm_get_categories(session)
-    keyboard = get_user_catalog_btns(level=level, categories=categories)
-
-    return image, keyboard
+    await message.answer_photo(media.media, caption=media.caption, reply_markup=reply_markup)
 
 
-def pages(paginator: Paginator):
-    btns = dict()
-    if paginator.has_previous():
-        btns["◀ Пред."] = "previous"
-    if paginator.has_next():
-        btns["След. ▶"] = "next"
-    return btns
-
-
-async def products(session, level, category, page):
-    products = await orm_get_products(session, category_id=category)
-
-    paginator = Paginator(products, page=page)
-    product = paginator.get_page()[0]
-
-    image = InputMediaPhoto(
-        media=product.image,
-        caption=f"<b>{product.name}</b>\n"
-                f"{product.description}\n"
-                f"Стоимость: {round(product.price, 2)}₽ \n\
-                <b>Товар {paginator.page} из {paginator.pages}</b>",
-        parse_mode='HTML'
+async def add_to_cart(callback: types.CallbackQuery, callback_data: MenuCallBack, session: AsyncSession):
+    user = callback.from_user
+    await orm_add_user(
+        session,
+        user_id=user.id,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        phone=None,
     )
 
-    pagination_btns = pages(paginator)
-
-    keyboard = get_products_btns(
-        level=level,
-        category=category,
-        page=page,
-        pagination_btns=pagination_btns,
-        product_id=product.id,
-    )
-
-    return image, keyboard
+    await orm_add_to_cart(session, user_id=user.id, product_id=callback_data.product_id)
+    await callback.answer("Товар добавлен в корзину.")
 
 
-async def carts(session, level, menu_name, page, user_id, product_id):
-    if menu_name == "delete":
-        await orm_delete_from_cart(session, user_id, product_id)
-        if page > 1:
-            page -= 1
-    elif menu_name == "decrement":
-        is_cart = await orm_reduce_product_in_cart(session, user_id, product_id)
-        if page > 1 and not is_cart:
-            page -= 1
-    elif menu_name == "increment":
-        await orm_add_to_cart(session, user_id, product_id)
+async def order(callback: types.CallbackQuery, session: AsyncSession):
+    # обрабатываем нажатие на заказать и выводим cообщение-заглушку для пользователя
+    await callback.answer("Ваш заказ оформлен!")
 
-    carts = await orm_get_user_carts(session, user_id)
+    # после нажатия возвращаемся в главное меню для приятного интерфейса
+    media, reply_markup = await get_menu_content(session, level=0, menu_name='main')
+    await callback.message.edit_media(media=media, reply_markup=reply_markup)
 
-    if not carts:
-        banner = await orm_get_banner(session, "cart")
-        image = InputMediaPhoto(
-            media=banner.image, caption=f"<b>{banner.description}</b>", parse_mode='HTML'
-        )
 
-        keyboard = get_user_cart(
-            level=level,
-            page=None,
-            pagination_btns=None,
-            product_id=None,
-        )
+@user_private_router.callback_query(MenuCallBack.filter())
+async def user_menu(callback: types.CallbackQuery, callback_data: MenuCallBack, session: AsyncSession):
 
+    if callback_data.menu_name == "add_to_cart":
+        await add_to_cart(callback, callback_data, session)
+        return
+    elif callback_data.menu_name == "order":
+        await order(callback, session)
+        return
     else:
-        paginator = Paginator(carts, page=page)
-
-        cart = paginator.get_page()[0]
-
-        cart_price = round(cart.quantity * cart.product.price, 2)
-        total_price = round(
-            sum(cart.quantity * cart.product.price for cart in carts), 2
-        )
-        image = InputMediaPhoto(
-            media=cart.product.image,
-            caption=f"<b>{cart.product.name}</b>\n{cart.product.price}₽ x {cart.quantity} = {cart_price}₽\
-                    \nТовар {paginator.page} из {paginator.pages} в корзине.\nСтоимость товаров в корзине <b>{total_price}</b>",
-            parse_mode='HTML'
+        media, reply_markup = await get_menu_content(
+            session,
+            level=callback_data.level,
+            menu_name=callback_data.menu_name,
+            category=callback_data.category,
+            page=callback_data.page,
+            product_id=callback_data.product_id,
+            user_id=callback.from_user.id,
         )
 
-        pagination_btns = pages(paginator)
-
-        keyboard = get_user_cart(
-            level=level,
-            page=page,
-            pagination_btns=pagination_btns,
-            product_id=cart.product.id,
-        )
-
-    return image, keyboard
-
-
-async def get_menu_content(session: AsyncSession, level: int, menu_name: str, category: Optional[int] = None, page: Optional[int] = None, user_id: Optional[int] = None, product_id: Optional[int] = None):
-    if level == 0:
-        return await main_menu(session, level, menu_name)
-    elif level == 1:
-        return await catalog(session, level, menu_name)
-    elif level == 2:
-        return await products(session, level, category, page)
-    elif level == 3:
-        return await carts(session, level, menu_name, page, user_id, product_id)
-
+        await callback.message.edit_media(media=media, reply_markup=reply_markup)
+        await callback.answer()
